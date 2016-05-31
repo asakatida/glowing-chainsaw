@@ -10,10 +10,11 @@ def decompress
 def open
 """
 
+import collections
 import io
 import os
+import struct
 import typing
-import collections
 
 from pprint import pprint
 
@@ -32,6 +33,8 @@ OptMetaData = typing.Optional[MetaData]
 
 MetaTree = typing.Dict[int, typing.Union['MetaTree', int]]  # noqa
 
+FlatFmt = typing.List[typing.Optional[int]]  # noqa
+
 ByteLines = typing.List[bytes]  # noqa
 ByteLinesIter = typing.Iterable[bytes]  # noqa
 Files = typing.Union['StatesFile', typing.TextIO]
@@ -42,7 +45,7 @@ def build_followers_size(data: bytes, count: int) -> OptMetaData:
     flat_node = {bytes(reversed(data[-count:])): -1}
     for position in range(len(data) - count - 1):
         end = position + count
-        key = bytes(reversed(data[position:end]))
+        key = bytes(reversed(data[position:end])).ljust(count, b'\xFF')
         value = data[end + 1]
         if flat_node.setdefault(key, value) != value:
             return None
@@ -51,7 +54,7 @@ def build_followers_size(data: bytes, count: int) -> OptMetaData:
 
 def build_unique_followers(data: bytes) -> MetaData:
     """find shortest size that uniquely maps to next byte."""
-    for size in range(1, len(data)):
+    for size in range(len(data)):
         flat_node = build_followers_size(data, size)
         if flat_node:
             return flat_node
@@ -108,28 +111,59 @@ def tree() -> typing.Mapping:
 def meta_to_tree(flat_node: MetaData) -> MetaTree:
     """convert meta mapping to tree format."""
     tree_root = tree()
-    ref = tree_root
     for key, value in flat_node.items():
+        ref = tree_root
         for lookback in key:
             ref = ref[lookback]
         ref = ref[value]
         ref.default_factory = None
-        ref = tree_root
     return strip_tree(tree_root)
 
 
-def serialize_branch(tree_root: MetaTree, base_idx: int=1) -> bytes:
+def serialize_branch(tree_root: MetaTree, base_idx: int) -> (FlatFmt, int):
     """convert branch to wire format."""
-    flat = []
-    for key, value in tree_root:
-        flat[key] = None
-    return b''
+    flat = [None] * (max(tree_root.keys()) + 1)
+    sub_flat = []
+    next_idx = base_idx
+    for key, value in tree_root.items():
+        if isinstance(value, int):
+            flat[key] = value
+            continue
+        seri, key_idx = serialize_branch(value, next_idx)
+        flat[key] = key_idx
+        next_idx += len(seri)
+        sub_flat += seri
+    return sub_flat + flat, next_idx
 
 
-def serialize_meta(tree_root: MetaTree, base_idx: int=1) -> (bytes, int):
+def pack_format(flat: FlatFmt) -> bytes:
+    packer = struct.Struct('>Q')
+    fail_idx = packer.pack(len(flat) + 2)
+    eof_idx = packer.pack(0)
+
+    def make_real_idx(idx: typing.Optional[int]) -> bytes:
+        if idx is None:
+            return fail_idx
+        elif idx < 0:
+            return eof_idx
+        return packer.pack(idx)
+    return b''.join(make_real_idx(idx) for idx in flat)
+
+
+def serialize_meta(start: int, tree_root: MetaTree) -> bytes:
     """convert mapping to wire format."""
-    next_idx = max(tree_root.keys()) + base_idx
-    return b'', base_idx
+    flat = [start] + [None] * 256
+    sub_flat = []
+    next_idx = len(flat)
+    for key, value in tree_root.items():
+        if isinstance(value, int):
+            flat[key] = value
+            continue
+        seri, key_idx = serialize_branch(value, next_idx)
+        flat[key] = key_idx
+        next_idx += len(seri)
+        sub_flat += seri
+    return pack_format(flat + sub_flat)
 
 
 class StatesCompressor:
@@ -150,12 +184,16 @@ class StatesCompressor:
     def flush(self) -> bytes:
         """end input stream and return compressed form."""
         data = self._data.getvalue()
-        if len(data) <= 2:
-            return data
         flat_node = build_unique_followers(data)
         condense = condense_unique_map(flat_node)
         tree_root = meta_to_tree(condense)
-        return tree_root
+        return serialize_meta(data[0], tree_root)
+
+
+def deserialize_wire(data: bytes) -> bytes:
+    flat = list(struct.iter_unpack('>Q', data))
+    output = io.BytesIO(bytes([flat[0]]))
+    return output.getvalue()
 
 
 class StatesDecompressor:
@@ -171,13 +209,14 @@ class StatesDecompressor:
         self._needs_input = True
         self._unused_data = io.BytesIO()
 
-    def decompress(self, data: bytes, *, max_length: int=-1) -> bytes:
+    def decompress(self, data: bytes, max_length: int=-1) -> bytes:
         """get partial reconstruction of stream."""
         self._data.write(data)
         if max_length < 0:
-            return self._data.getvalue()
+            return deserialize_wire(self._data.getvalue())
         elif max_length == 0:
-            return self._data.getvalue()
+            return b''
+        data = self._data.getvalue()
         return self._data.getvalue()
 
     @property
@@ -335,4 +374,9 @@ def open(filename: str, **kwargs) -> Files:   # noqa
 
 if __name__ == '__main__':
     with io.FileIO(__file__) as istream:
-        pprint(compress(istream.read()))
+        orig = istream.read()
+        new = compress(orig)
+        trip = decompress(new)
+        pprint(trip)
+        pprint(len(new) / len(orig))
+        pprint(orig == trip)
