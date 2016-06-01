@@ -26,6 +26,8 @@ __all__ = [
     'decompress',
     'open']
 
+SIGNATURE = b'YWRhbQ'
+
 MetaData = typing.Dict[bytes, int]   # noqa
 MetaKeys = typing.MutableSet[bytes]  # noqa
 MetaValues = typing.MutableSet[int]  # noqa
@@ -137,17 +139,34 @@ def serialize_branch(tree_root: MetaTree, base_idx: int) -> (FlatFmt, int):
 
 
 def pack_format(flat: FlatFmt) -> bytes:
-    packer = struct.Struct('>Q')
-    fail_idx = packer.pack(len(flat) + 2)
+    """pack collection of indexes into a tagged byte format."""
+    size = len(flat) + 2
+    bytes_size = (size.bit_length() // 8) + 1
+    if bytes_size > 4:
+        format_str = '>Q'
+    elif bytes_size > 2:
+        format_str = '>L'
+    elif bytes_size > 1:
+        format_str = '>H'
+    else:
+        format_str = '>B'
+    packer = struct.Struct(format_str)
+    fail_idx = packer.pack(size)
     eof_idx = packer.pack(0)
 
-    def make_real_idx(idx: typing.Optional[int]) -> bytes:
+    def real_idx(idx: typing.Optional[int]) -> bytes:
+        """handle special fake indexes."""
         if idx is None:
             return fail_idx
         elif idx < 0:
             return eof_idx
         return packer.pack(idx)
-    return b''.join(make_real_idx(idx) for idx in flat)
+
+    if format_str == '>B':
+        format_str.ljust(3, '\x00')
+    format_str = format_str.encode()
+
+    return SIGNATURE + format_str + b''.join(real_idx(idx) for idx in flat)
 
 
 def serialize_meta(start: int, tree_root: MetaTree) -> bytes:
@@ -191,8 +210,16 @@ class StatesCompressor:
 
 
 def deserialize_wire(data: bytes) -> bytes:
-    flat = list(struct.iter_unpack('>Q', data))
-    output = io.BytesIO(bytes([flat[0]]))
+    """get collection of indexes from wire format."""
+    signature = data[:len(SIGNATURE)]
+    if signature != SIGNATURE:
+        return b''
+    tag_idx = data.index(0)
+    unpacker = struct.Struct(data[len(SIGNATURE):tag_idx])
+    if unpacker.size == 1:
+        tag_idx += 1
+    flat = list(unpacker.iter_unpack(data[tag_idx:]))
+    output = io.BytesIO(bytes(flat[0]))
     return output.getvalue()
 
 
