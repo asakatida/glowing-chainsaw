@@ -12,6 +12,7 @@ def open
 
 import collections
 import io
+import itertools
 import os
 import struct
 import typing
@@ -140,18 +141,18 @@ def serialize_branch(tree_root: MetaTree, base_idx: int) -> (FlatFmt, int):
 
 def pack_format(flat: FlatFmt) -> bytes:
     """pack collection of indexes into a tagged byte format."""
-    size = len(flat) + 2
-    bytes_size = (size.bit_length() // 8) + 1
-    if bytes_size > 4:
+    size = len(flat)
+    max_idx = size + 0x101
+    if max_idx > 0xFFFFFFFF:
         format_str = '>Q'
-    elif bytes_size > 2:
+    elif max_idx > 0xFFFF:
         format_str = '>L'
-    elif bytes_size > 1:
+    elif max_idx > 0xFF:
         format_str = '>H'
     else:
         format_str = '>B'
     packer = struct.Struct(format_str)
-    fail_idx = packer.pack(size)
+    fail_idx = packer.pack(max_idx)
     eof_idx = packer.pack(0)
 
     def real_idx(idx: typing.Optional[int]) -> bytes:
@@ -160,10 +161,12 @@ def pack_format(flat: FlatFmt) -> bytes:
             return fail_idx
         elif idx < 0:
             return eof_idx
+        elif idx < 0x100:
+            idx += size
         return packer.pack(idx)
 
-    if format_str == '>B':
-        format_str.ljust(3, '\x00')
+    if packer.size == 1:
+        format_str = format_str.ljust(len(format_str) + 1, '\x00')
     format_str = format_str.encode()
 
     return SIGNATURE + format_str + b''.join(real_idx(idx) for idx in flat)
@@ -214,12 +217,35 @@ def deserialize_wire(data: bytes) -> bytes:
     signature = data[:len(SIGNATURE)]
     if signature != SIGNATURE:
         return b''
+
     tag_idx = data.index(0)
     unpacker = struct.Struct(data[len(SIGNATURE):tag_idx])
     if unpacker.size == 1:
         tag_idx += 1
-    flat = list(unpacker.iter_unpack(data[tag_idx:]))
-    output = io.BytesIO(bytes(flat[0]))
+
+    flat = list(
+        itertools.chain.from_iterable(unpacker.iter_unpack(data[tag_idx:])))
+
+    size = len(flat)
+    output = io.BytesIO(bytes((flat[0] - size,)))
+    index = -1
+    flat_offset = 1
+    while True:
+        if index < -len(output.getvalue()):
+            lookback = 0xFF
+        else:
+            lookback = output.getvalue()[index]
+        index -= 1
+        try:
+            flat_offset = flat[flat_offset + lookback]
+        except:
+            break
+        if flat_offset == 0:
+            break
+        elif flat_offset > size:
+            output.write(bytes((flat_offset - size,)))
+            index = -1
+            flat_offset = 1
     return output.getvalue()
 
 
