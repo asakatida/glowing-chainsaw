@@ -43,24 +43,63 @@ ByteLinesIter = typing.Iterable[bytes]  # noqa
 Files = typing.Union['StatesFile', typing.TextIO]
 
 
-def build_followers_size(data: bytes, count: int) -> OptMetaData:
-    """map subsequences to next byte if unique."""
-    flat_node = {bytes(reversed(data[-count:])): -1}
-    for end in range(len(data) - 1):
-        start = max(end - count, 0)
-        key = bytes(reversed(data[start:end])).ljust(count, b'\x00')
-        value = data[end + 1]
-        if flat_node.setdefault(key, value) != value:
-            return None
-    return flat_node
+class Followers:
+    @classmethod
+    def from_data(cls, data: bytes) -> 'Followers':
+        return cls(data=data)
 
+    @classmethod
+    def from_meta(cls, meta: MetaData) -> 'Followers':
+        return cls(meta=meta)
 
-def build_unique_followers(data: bytes) -> MetaData:
-    """find shortest size that uniquely maps to next byte."""
-    for size in range(len(data)):
-        flat_node = build_followers_size(data, size)
-        if flat_node:
-            return flat_node
+    def __init__(self, *, data: bytes=None, meta: MetaData=None) -> None:
+        self._data = data
+        self._meta = meta
+
+    def _restore(self) -> bytes:
+        """restore."""
+        count = len(next(iter(self._meta.keys())))
+        data = b'\x00' * count
+        while True:
+            key = bytes(reversed(data[-count:]))
+            value = self._meta[key]
+            if value == -1:
+                break
+            data += bytes((value,))
+        return data[count:]
+
+    def _analyse(self, count: int) -> OptMetaData:
+        """map subsequences to next byte if unique."""
+        flat_node = {
+            bytes(reversed(self._data[-count:])): -1,
+            b'\x00' * count: self._data[0]
+            }
+        for end in range(len(self._data) - 1):
+            start = max(end - count, 0)
+            key = bytes(reversed(self._data[start:end])).ljust(count, b'\x00')
+            value = self._data[end + 1]
+            if flat_node.setdefault(key, value) != value:
+                return None
+        return flat_node
+
+    @property
+    def data(self) -> bytes:
+        """restore."""
+        if self._data is not None:
+            return self._data
+        self._data = self._restore()
+        return self._data
+
+    @property
+    def meta(self) -> MetaData:
+        """find shortest size that uniquely maps to next byte."""
+        if self._meta is not None:
+            return self._meta
+        for count in range(len(self._data)):
+            flat_node = self._analyse(count)
+            if flat_node:
+                self._meta = flat_node
+                return self._meta
 
 
 def truncate_keys(count: int, flat_node: MetaData) -> MetaKeys:
@@ -205,8 +244,8 @@ class StatesCompressor:
     def flush(self) -> bytes:
         """end input stream and return compressed form."""
         data = self._data.getvalue()
-        flat_node = build_unique_followers(data)
-        condense = condense_unique_map(flat_node)
+        followers = Followers.from_data(data)
+        condense = condense_unique_map(followers.meta)
         tree_root = meta_to_tree(condense)
         return serialize_meta(data[0], tree_root)
 
@@ -431,8 +470,15 @@ def open(filename: str, **kwargs) -> Files:   # noqa
 
 
 if __name__ == '__main__':
+    orig = b'test'
+    followers = Followers.from_data(orig)
+    pprint(orig == Followers.from_meta(followers.meta).data)
+    pprint(orig == followers.data)
     with io.FileIO(__file__) as istream:
         orig = istream.read()
+        followers = Followers.from_data(orig)
+        pprint(orig == Followers.from_meta(followers.meta).data)
+        pprint(orig == followers.data)
         new = compress(orig)
         trip = decompress(new)
         pprint(trip)
