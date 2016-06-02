@@ -46,9 +46,9 @@ Files = typing.Union['StatesFile', typing.TextIO]
 def build_followers_size(data: bytes, count: int) -> OptMetaData:
     """map subsequences to next byte if unique."""
     flat_node = {bytes(reversed(data[-count:])): -1}
-    for position in range(len(data) - count - 1):
-        end = position + count
-        key = bytes(reversed(data[position:end])).ljust(count, b'\xFF')
+    for end in range(len(data) - 1):
+        start = max(end - count, 0)
+        key = bytes(reversed(data[start:end])).ljust(count, b'\x00')
         value = data[end + 1]
         if flat_node.setdefault(key, value) != value:
             return None
@@ -141,19 +141,19 @@ def serialize_branch(tree_root: MetaTree, base_idx: int) -> (FlatFmt, int):
 
 def pack_format(flat: FlatFmt) -> bytes:
     """pack collection of indexes into a tagged byte format."""
-    size = len(flat)
-    max_idx = size + 0x101
-    if max_idx > 0xFFFFFFFF:
+    max_idx = len(flat)
+    if max_idx >= 0xFFFFFFFF:
         format_str = '>Q'
-    elif max_idx > 0xFFFF:
+    elif max_idx >= 0xFFFF:
         format_str = '>L'
-    elif max_idx > 0xFF:
+    elif max_idx >= 0xFF:
         format_str = '>H'
     else:
         format_str = '>B'
     packer = struct.Struct(format_str)
-    fail_idx = packer.pack(max_idx)
-    eof_idx = packer.pack(0)
+
+    fail_idx = b'\xFF' * packer.size
+    eof_idx = packer.pack(max_idx)
 
     def real_idx(idx: typing.Optional[int]) -> bytes:
         """handle special fake indexes."""
@@ -161,8 +161,6 @@ def pack_format(flat: FlatFmt) -> bytes:
             return fail_idx
         elif idx < 0:
             return eof_idx
-        elif idx < 0x100:
-            idx += size
         return packer.pack(idx)
 
     if packer.size == 1:
@@ -174,18 +172,19 @@ def pack_format(flat: FlatFmt) -> bytes:
 
 def serialize_meta(start: int, tree_root: MetaTree) -> bytes:
     """convert mapping to wire format."""
-    flat = [start] + [None] * 256
+    max_key = max(tree_root.keys())
+    top = [None] * (max_key + 1)
     sub_flat = []
-    next_idx = len(flat)
+    next_idx = len(top)
     for key, value in tree_root.items():
         if isinstance(value, int):
-            flat[key] = value
+            top[key] = value
             continue
         seri, key_idx = serialize_branch(value, next_idx)
-        flat[key] = key_idx
+        top[key] = key_idx
         next_idx += len(seri)
         sub_flat += seri
-    return pack_format(flat + sub_flat)
+    return pack_format([max_key] + top + sub_flat)
 
 
 class StatesCompressor:
@@ -223,29 +222,35 @@ def deserialize_wire(data: bytes) -> bytes:
     if unpacker.size == 1:
         tag_idx += 1
 
-    flat = list(
-        itertools.chain.from_iterable(unpacker.iter_unpack(data[tag_idx:])))
+    states_data = data[tag_idx:]
 
-    size = len(flat)
-    output = io.BytesIO(bytes((flat[0] - size,)))
+    indexes = unpacker.iter_unpack(states_data)
+
+    max_key = next(indexes)[0]
+
+    flat = list(itertools.chain.from_iterable(indexes))
+
+    max_idx = len(flat) + 1
+
+    output = io.BytesIO()
     index = -1
-    flat_offset = 1
+    flat_offset = 0
     while True:
         if index < -len(output.getvalue()):
-            lookback = 0xFF
+            lookback = 0
         else:
             lookback = output.getvalue()[index]
         index -= 1
         try:
             flat_offset = flat[flat_offset + lookback]
-        except:
+        except IndexError:
             break
-        if flat_offset == 0:
+        if flat_offset == max_idx:
             break
-        elif flat_offset > size:
-            output.write(bytes((flat_offset - size,)))
+        elif flat_offset <= max_key:
+            output.write(bytes((flat_offset,)))
             index = -1
-            flat_offset = 1
+            flat_offset = 0
     return output.getvalue()
 
 
