@@ -14,6 +14,7 @@ import collections
 import io
 import itertools
 import os
+import pathlib
 import struct
 import typing
 
@@ -29,7 +30,7 @@ __all__ = [
 
 SIGNATURE = b'YWRhbQ'
 
-MetaData = typing.Dict[bytes, int]   # noqa
+MetaData = typing.Dict[bytes, int]  # noqa
 MetaKeys = typing.MutableSet[bytes]  # noqa
 MetaValues = typing.MutableSet[int]  # noqa
 OptMetaData = typing.Optional[MetaData]
@@ -70,14 +71,11 @@ class Followers:
 
     def _analyse(self, count: int) -> OptMetaData:
         """map subsequences to next byte if unique."""
-        flat_node = {
-            bytes(reversed(self._data[-count:])): -1,
-            b'\x00' * count: self._data[0]
-            }
-        for end in range(len(self._data) - 1):
+        flat_node = {bytes(reversed(self._data[-count:])): -1}
+        for end in range(len(self._data)):
             start = max(end - count, 0)
             key = bytes(reversed(self._data[start:end])).ljust(count, b'\x00')
-            value = self._data[end + 1]
+            value = self._data[end]
             if flat_node.setdefault(key, value) != value:
                 return None
         return flat_node
@@ -95,7 +93,7 @@ class Followers:
         """find shortest size that uniquely maps to next byte."""
         if self._meta is not None:
             return self._meta
-        for count in range(len(self._data)):
+        for count in range(len(self._data) + 1):
             flat_node = self._analyse(count)
             if flat_node:
                 self._meta = flat_node
@@ -135,64 +133,30 @@ def condense_unique_map(flat_node: MetaData) -> MetaData:
     return condense
 
 
-def strip_tree(tree_root: MetaTree) -> MetaTree:
-    """replace value tags from tree with terminal."""
-    striped = {}
-    for key, value in tree_root.items():
-        if value == {}:
-            return key
-        striped[key] = strip_tree(value)
-    return striped
-
-
-def tree() -> typing.Mapping:
-    """autovivification tree."""
-    return collections.defaultdict(tree)
-
-
 def meta_to_tree(flat_node: MetaData) -> MetaTree:
     """convert meta mapping to tree format."""
-    tree_root = tree()
+    tree_root = {}
     for key, value in flat_node.items():
         ref = tree_root
-        for lookback in key:
-            ref = ref[lookback]
-        ref = ref[value]
-        ref.default_factory = None
-    return strip_tree(tree_root)
-
-
-def serialize_branch(tree_root: MetaTree, base_idx: int) -> (FlatFmt, int):
-    """convert branch to wire format."""
-    flat = [None] * (max(tree_root.keys()) + 1)
-    sub_flat = []
-    next_idx = base_idx
-    for key, value in tree_root.items():
-        if isinstance(value, int):
-            flat[key] = value
-            continue
-        seri, key_idx = serialize_branch(value, next_idx)
-        flat[key] = key_idx
-        next_idx += len(seri)
-        sub_flat += seri
-    return sub_flat + flat, next_idx
+        for lookback in key[:-1]:
+            ref = ref.setdefault(lookback, {})
+        ref[key[-1]] = value
+    return tree_root
 
 
 def pack_format(flat: FlatFmt) -> bytes:
     """pack collection of indexes into a tagged byte format."""
-    max_idx = len(flat)
-    if max_idx >= 0xFFFFFFFF:
-        format_str = '>Q'
-    elif max_idx >= 0xFFFF:
+    max_idx = max(flat, key=lambda idx: idx or 0)
+    if max_idx > 0xFFFF:
         format_str = '>L'
-    elif max_idx >= 0xFF:
+    elif max_idx > 0xFF:
         format_str = '>H'
     else:
         format_str = '>B'
     packer = struct.Struct(format_str)
 
-    fail_idx = b'\xFF' * packer.size
-    eof_idx = packer.pack(max_idx)
+    fail_idx = packer.unpack(b'\xFF' * packer.size)[0]
+    eof_idx = len(flat)
 
     def real_idx(idx: typing.Optional[int]) -> bytes:
         """handle special fake indexes."""
@@ -200,30 +164,120 @@ def pack_format(flat: FlatFmt) -> bytes:
             return fail_idx
         elif idx < 0:
             return eof_idx
-        return packer.pack(idx)
+        return idx
 
     if packer.size == 1:
         format_str = format_str.ljust(len(format_str) + 1, '\x00')
-    format_str = format_str.encode()
+    format_str = SIGNATURE + format_str.encode()
 
-    return SIGNATURE + format_str + b''.join(real_idx(idx) for idx in flat)
+    return format_str + b''.join(packer.pack(real_idx(idx)) for idx in flat)
 
 
-def serialize_meta(start: int, tree_root: MetaTree) -> bytes:
-    """convert mapping to wire format."""
-    max_key = max(tree_root.keys())
-    top = [None] * (max_key + 1)
-    sub_flat = []
-    next_idx = len(top)
+def freeze_tree(tree_root: MetaTree, found) -> MetaTree:
+    root = {}
     for key, value in tree_root.items():
         if isinstance(value, int):
-            top[key] = value
+            root[key] = value
             continue
-        seri, key_idx = serialize_branch(value, next_idx)
-        top[key] = key_idx
+        frozen = freeze_tree(value, found)
+        if frozen in found:
+            root[key] = next(sub for sub in found if sub == frozen)
+            continue
+        root[key] = frozen
+        found.add(frozen)
+    return frozenset(root.items())
+
+
+def extract_max(tree_root: MetaTree) -> int:
+    return max(key for key, _ in tree_root)
+
+
+def extract_min(tree_root: MetaTree) -> int:
+    return min(key for key, _ in tree_root)
+
+
+def serialize_branch(
+        tree_root: MetaTree, found, base_idx: int=0) -> FlatFmt:
+    """convert branch to wire format."""
+    small = extract_min(tree_root) - 1
+    flat = [None] * (extract_max(tree_root) - small + 1)
+    flat[0] = small
+    next_idx = base_idx + len(flat)
+    for key, value in tree_root:
+        key -= small
+        if isinstance(value, int):
+            flat[key] = value
+            continue
+        if value in found:
+            flat[key] = found[value]
+            continue
+        seri = serialize_branch(value, found, next_idx)
+        flat[key] = next_idx
+        found[value] = next_idx
         next_idx += len(seri)
-        sub_flat += seri
-    return pack_format([max_key] + top + sub_flat)
+        flat += seri
+    return flat
+
+
+def serialize_meta(tree_root: MetaTree) -> bytes:
+    """convert mapping to wire format."""
+    frozen = freeze_tree(tree_root, set())
+    top = serialize_branch(frozen, dict())
+    return pack_format([extract_max(frozen)] + top)
+
+
+def make_queue(tree_root: MetaTree) -> MetaKeys:
+    """make_queue."""
+    return set(
+        key
+        for key in tree_root.keys() if not isinstance(tree_root[key], int))
+
+
+def mergable_tree(left: MetaTree, right: MetaTree) -> bool:
+    """mergable_tree."""
+    for key in set(left.keys()).intersection(right.keys()):
+        if left[key] != right[key]:
+            return False
+    return True
+
+
+def flatten_tree(tree_root: MetaTree) -> MetaTree:
+    """flatten_tree."""
+    root = {}
+    for key, value in tree_root.items():
+        if isinstance(value, int):
+            root[key] = value
+        else:
+            root[key] = flatten_tree(value)
+    queue = make_queue(root)
+    while queue:
+        key = queue.pop()
+        value = root[key]
+        if mergable_tree(root, value):
+            root.pop(key)
+            root.update(value.items())
+            queue.update(make_queue(value))
+    return root
+
+
+def merge_tree(tree_root: MetaTree) -> MetaTree:
+    """merge_tree."""
+    root = {}
+    for key, value in tree_root.items():
+        if isinstance(value, int):
+            root[key] = value
+        else:
+            root[key] = merge_tree(value)
+    queue = make_queue(root)
+    while queue:
+        key = queue.pop()
+        value = root[key]
+        for sibling_key in make_queue(root).difference({key}):
+            sibling_value = root[sibling_key]
+            if mergable_tree(sibling_value, value):
+                value.update(sibling_value)
+                root[sibling_key] = value
+    return root
 
 
 class StatesCompressor:
@@ -246,8 +300,8 @@ class StatesCompressor:
         data = self._data.getvalue()
         followers = Followers.from_data(data)
         condense = condense_unique_map(followers.meta)
-        tree_root = meta_to_tree(condense)
-        return serialize_meta(data[0], tree_root)
+        tree_root = flatten_tree(meta_to_tree(condense))
+        return serialize_meta(merge_tree(tree_root))
 
 
 def deserialize_wire(data: bytes) -> bytes:
@@ -271,6 +325,8 @@ def deserialize_wire(data: bytes) -> bytes:
 
     max_idx = len(flat) + 1
 
+    fail_idx = unpacker.unpack(b'\xFF' * unpacker.size)
+
     output = io.BytesIO()
     index = -1
     flat_offset = 0
@@ -280,16 +336,15 @@ def deserialize_wire(data: bytes) -> bytes:
         else:
             lookback = output.getvalue()[index]
         index -= 1
-        try:
-            flat_offset = flat[flat_offset + lookback]
-        except IndexError:
-            break
+        flat_offset = flat[flat_offset + lookback - flat[flat_offset]]
         if flat_offset == max_idx:
             break
         elif flat_offset <= max_key:
             output.write(bytes((flat_offset,)))
             index = -1
             flat_offset = 0
+        elif flat_offset == fail_idx:
+            break
     return output.getvalue()
 
 
@@ -470,17 +525,16 @@ def open(filename: str, **kwargs) -> Files:   # noqa
 
 
 if __name__ == '__main__':
-    orig = b'test'
-    followers = Followers.from_data(orig)
-    pprint(orig == Followers.from_meta(followers.meta).data)
-    pprint(orig == followers.data)
     with io.FileIO(__file__) as istream:
         orig = istream.read()
         followers = Followers.from_data(orig)
-        pprint(orig == Followers.from_meta(followers.meta).data)
-        pprint(orig == followers.data)
         new = compress(orig)
         trip = decompress(new)
-        pprint(trip)
-        pprint(len(new) / len(orig))
-        pprint(orig == trip)
+        if orig == trip:
+            pprint(len(new) / len(orig))
+            for file in pathlib.Path('.').iterdir():
+                if file.is_file():
+                    file.with_suffix('.states').write_bytes(
+                        compress(file.read_bytes()))
+        else:
+            pprint(trip)
