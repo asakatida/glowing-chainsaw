@@ -1,5 +1,5 @@
 """
-toy compression algorithm with an interface matching stdlib bz2 module.
+toy compression algorithm with an interface matching stdlib modules.
 
 class StatesError
 
@@ -22,6 +22,7 @@ import typing
 from pprint import pprint
 
 __all__ = [
+    'StatesError',
     'StatesCompressor',
     'StatesDecompressor',
     'StatesFile',
@@ -49,22 +50,42 @@ class StatesError(Exception):
     """StatesError."""
 
 
-class Followers:
-    """Followers."""
+class Reversible:
+    """Reversible."""
 
     @classmethod
-    def from_data(cls, data: bytes) -> 'Followers':
+    def from_data(cls, data) -> 'Reversible':
         """from_data."""
         return cls(data=data)
 
     @classmethod
-    def from_meta(cls, meta: MetaData) -> 'Followers':
+    def from_meta(cls, meta) -> 'Reversible':
         """from_meta."""
         return cls(meta=meta)
 
-    def __init__(self, *, data: bytes=None, meta: MetaData=None) -> None:
+    def __init__(self, *, data=None, meta=None) -> None:
         self._data = data
         self._meta = meta
+
+    @property
+    def data(self):
+        """restore."""
+        if self._data is not None:
+            return self._data
+        self._data = self._restore()
+        return self._data
+
+    @property
+    def meta(self):
+        """analyse."""
+        if self._meta is not None:
+            return self._meta
+        self._meta = self._analyse()
+        return self._meta
+
+
+class Followers(Reversible):
+    """Followers."""
 
     def _restore(self) -> bytes:
         """restore."""
@@ -78,7 +99,7 @@ class Followers:
             data += bytes((value,))
         return data[count:]
 
-    def _analyse(self, count: int) -> OptMetaData:
+    def __analyse(self, count: int) -> OptMetaData:
         """map subsequences to next byte if unique."""
         flat_node = {bytes(reversed(self._data[-count:])): -1}
         for end in range(len(self._data)):
@@ -89,69 +110,87 @@ class Followers:
                 return None
         return flat_node
 
-    @property
-    def data(self) -> bytes:
-        """restore."""
-        if self._data is not None:
-            return self._data
-        self._data = self._restore()
-        return self._data
-
-    @property
-    def meta(self) -> MetaData:
+    def _analyse(self) -> MetaData:
         """find shortest size that uniquely maps to next byte."""
-        if self._meta is not None:
-            return self._meta
         for count in range(len(self._data) + 1):
-            flat_node = self._analyse(count)
+            flat_node = self.__analyse(count)
             if flat_node:
-                self._meta = flat_node
-                return self._meta
+                return flat_node
         raise StatesError
 
 
-def truncate_keys(count: int, flat_node: MetaData) -> MetaKeys:
-    """get all keys truncated to length."""
-    return set(key[:count] for key in flat_node.keys())
+class KeyTrunc(Reversible):
+    """KeyTrunc."""
+
+    def _restore(self) -> MetaData:
+        """restore."""
+        inflate = {}  # type: Dict[bytes, int]
+        unique_size = max(len(key) for key in self._meta.keys())
+        next_key = b'\x00' * unique_size
+        while True:
+            for count in range(unique_size + 1, 0, -1):
+                value = self._meta.get(next_key[:count], None)
+                if value is not None:
+                    inflate[next_key] = value
+                    if value == -1:
+                        return inflate
+                    next_key = (bytes([value]) + next_key)[:unique_size]
+                    break
+                elif count == 1:
+                    raise StatesError
+
+    def _analyse(self) -> MetaData:
+        """get shortest sequence to match each next."""
+        flat_node = dict(self._data.items())
+        condense = {}  # type: Dict[bytes, int]
+        unique_size = len(next(iter(flat_node.keys()))) + 1
+        repeats = iter(range(1, unique_size))
+        while flat_node:
+            count = next(repeats)
+            for start in set(key[:count] for key in flat_node.keys()):
+                possible = set(
+                    flat_node.get(key)
+                    for key in flat_node.keys() if key.startswith(start))
+                if len(possible) == 1:
+                    condense[start] = possible.pop()
+                    for key in tuple(flat_node.keys()):
+                        if key.startswith(start):
+                            del flat_node[key]
+        return condense
 
 
-def filter_keys_values(start: bytes, flat_node: MetaData) -> MetaValues:
-    """filter values by keys that start with sequence."""
-    return set(
-        flat_node.get(key)
-        for key in flat_node.keys() if key.startswith(start))
+class Reshape(Reversible):
+    """Reshape."""
 
+    def _restore(self) -> MetaData:
+        """restore."""
+        flat_node = {}  # type: Dict[bytes, int]
+        tree_root = dict(self._meta.items())
+        while tree_root:
+            for key, value in tuple(tree_root.items()):
+                if isinstance(key, int):
+                    bytes_key = bytes((key,))
+                else:
+                    bytes_key = key
+                if isinstance(value, int):
+                    flat_node[bytes_key] = value
+                    continue
+                del tree_root[key]
+                for child_key, child_value in value.items():
+                    if isinstance(child_key, int):
+                        child_key = bytes((child_key,))
+                    tree_root[bytes_key + child_key] = child_value
+        return flat_node
 
-def discard_keys(start: bytes, flat_node: MetaData) -> None:
-    """remove keys that start with sequence."""
-    for key in set(key for key in flat_node.keys() if key.startswith(start)):
-        del flat_node[key]
-
-
-def condense_unique_map(flat_node: MetaData) -> MetaData:
-    """get shortest sequence to match each next."""
-    flat_node = dict(flat_node.items())
-    condense = {}  # type: Dict[bytes, int]
-    unique_size = len(next(iter(flat_node.keys()))) + 1
-    repeats = iter(range(1, unique_size))
-    while flat_node:
-        for start in truncate_keys(next(repeats), flat_node):
-            possible = filter_keys_values(start, flat_node)
-            if len(possible) == 1:
-                condense[start] = possible.pop()
-                discard_keys(start, flat_node)
-    return condense
-
-
-def meta_to_tree(flat_node: MetaData) -> MetaTree:
-    """convert meta mapping to tree format."""
-    tree_root = {}
-    for key, value in flat_node.items():
-        ref = tree_root
-        for lookback in key[:-1]:
-            ref = ref.setdefault(lookback, {})
-        ref[key[-1]] = value
-    return tree_root
+    def _analyse(self) -> MetaTree:
+        """convert meta mapping to tree format."""
+        tree_root = {}
+        for key, value in self._data.items():
+            ref = tree_root
+            for lookback in key[:-1]:
+                ref = ref.setdefault(lookback, {})
+            ref[key[-1]] = value
+        return tree_root
 
 
 def pack_format(flat: FlatFmt) -> bytes:
@@ -256,6 +295,7 @@ def mergable_tree(left: MetaTree, right: MetaTree) -> bool:
 
 def flatten_tree(tree_root: MetaTree) -> MetaTree:
     """flatten_tree."""
+    return tree_root
     root = {}
     for key, value in tree_root.items():
         if isinstance(value, int):
@@ -275,6 +315,7 @@ def flatten_tree(tree_root: MetaTree) -> MetaTree:
 
 def merge_tree(tree_root: MetaTree) -> MetaTree:
     """merge_tree."""
+    return tree_root
     root = {}
     for key, value in tree_root.items():
         if isinstance(value, int):
@@ -291,6 +332,22 @@ def merge_tree(tree_root: MetaTree) -> MetaTree:
                 value.update(sibling_value)
                 root[sibling_key] = value
     return root
+
+
+class States(Reversible):
+    """States."""
+
+    def _restore(self) -> bytes:
+        """restore."""
+        return deserialize_wire(self._meta)
+
+    def _analyse(self) -> bytes:
+        """analyse."""
+        node = Followers.from_data(self._data)
+        node = KeyTrunc.from_data(node.meta)
+        tree = Reshape.from_data(node.meta)
+        tree_root = flatten_tree(tree)
+        return serialize_meta(merge_tree(tree_root))
 
 
 class StatesCompressor:
@@ -310,10 +367,7 @@ class StatesCompressor:
 
     def flush(self) -> bytes:
         """end input stream and return compressed form."""
-        data = self._data.getvalue()
-        condense = condense_unique_map(Followers.from_data(data).meta)
-        tree_root = flatten_tree(meta_to_tree(condense))
-        return serialize_meta(merge_tree(tree_root))
+        return States.from_data(self._data.getvalue()).meta
 
 
 def deserialize_wire(data: bytes) -> bytes:
@@ -538,15 +592,9 @@ def open(filename: str, **kwargs) -> Files:   # noqa
 
 if __name__ == '__main__':
     with io.FileIO(__file__) as istream:
-        orig = istream.read()
-        followers = Followers.from_data(orig)
-        new = compress(orig)
-        trip = decompress(new)
-        if orig == trip:
-            pprint(len(new) / len(orig))
-            for file in pathlib.Path('.').iterdir():
-                if file.is_file():
-                    file.with_suffix('.states').write_bytes(
-                        compress(file.read_bytes()))
-        else:
-            pprint(trip)
+        orig = KeyTrunc.from_data(Followers.from_data(istream.read()).meta).meta
+        reshape = Reshape.from_data(orig)
+        new = Reshape.from_meta(reshape.meta).data
+        for key, value in orig.items():
+            if key not in new or new[key] != value:
+                pprint((key, value))
