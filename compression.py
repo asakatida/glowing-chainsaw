@@ -1,6 +1,8 @@
 """
 toy compression algorithm with an interface matching stdlib bz2 module.
 
+class StatesError
+
 class StatesCompressor
 class StatesDecompressor
 class StatesFile
@@ -10,7 +12,6 @@ def decompress
 def open
 """
 
-import collections
 import io
 import itertools
 import os
@@ -44,13 +45,21 @@ ByteLinesIter = typing.Iterable[bytes]  # noqa
 Files = typing.Union['StatesFile', typing.TextIO]
 
 
+class StatesError(Exception):
+    """StatesError."""
+
+
 class Followers:
+    """Followers."""
+
     @classmethod
     def from_data(cls, data: bytes) -> 'Followers':
+        """from_data."""
         return cls(data=data)
 
     @classmethod
     def from_meta(cls, meta: MetaData) -> 'Followers':
+        """from_meta."""
         return cls(meta=meta)
 
     def __init__(self, *, data: bytes=None, meta: MetaData=None) -> None:
@@ -98,6 +107,7 @@ class Followers:
             if flat_node:
                 self._meta = flat_node
                 return self._meta
+        raise StatesError
 
 
 def truncate_keys(count: int, flat_node: MetaData) -> MetaKeys:
@@ -174,6 +184,7 @@ def pack_format(flat: FlatFmt) -> bytes:
 
 
 def freeze_tree(tree_root: MetaTree, found) -> MetaTree:
+    """freeze_tree."""
     root = {}
     for key, value in tree_root.items():
         if isinstance(value, int):
@@ -189,10 +200,12 @@ def freeze_tree(tree_root: MetaTree, found) -> MetaTree:
 
 
 def extract_max(tree_root: MetaTree) -> int:
+    """extract_max."""
     return max(key for key, _ in tree_root)
 
 
 def extract_min(tree_root: MetaTree) -> int:
+    """extract_min."""
     return min(key for key, _ in tree_root)
 
 
@@ -298,8 +311,7 @@ class StatesCompressor:
     def flush(self) -> bytes:
         """end input stream and return compressed form."""
         data = self._data.getvalue()
-        followers = Followers.from_data(data)
-        condense = condense_unique_map(followers.meta)
+        condense = condense_unique_map(Followers.from_data(data).meta)
         tree_root = flatten_tree(meta_to_tree(condense))
         return serialize_meta(merge_tree(tree_root))
 
