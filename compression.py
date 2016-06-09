@@ -45,30 +45,33 @@ ByteLines = typing.List[bytes]  # noqa
 ByteLinesIter = typing.Iterable[bytes]  # noqa
 Files = typing.Union['StatesFile', typing.TextIO]
 
+D = typing.TypeVar('D')
+M = typing.TypeVar('M')
+
 
 class StatesError(Exception):
     """StatesError."""
 
 
-class Reversible:
+class Reversible(typing.Generic[D, M]):
     """Reversible."""
 
     @classmethod
-    def from_data(cls, data) -> 'Reversible':
+    def from_data(cls, data: D) -> 'Reversible':
         """from_data."""
         return cls(data=data)
 
     @classmethod
-    def from_meta(cls, meta) -> 'Reversible':
+    def from_meta(cls, meta: M) -> 'Reversible':
         """from_meta."""
         return cls(meta=meta)
 
-    def __init__(self, *, data=None, meta=None) -> None:
+    def __init__(self, *, data: D=None, meta: M=None) -> None:
         self._data = data
         self._meta = meta
 
     @property
-    def data(self):
+    def data(self) -> D:
         """restore."""
         if self._data is not None:
             return self._data
@@ -76,7 +79,7 @@ class Reversible:
         return self._data
 
     @property
-    def meta(self):
+    def meta(self) -> M:
         """analyse."""
         if self._meta is not None:
             return self._meta
@@ -84,7 +87,7 @@ class Reversible:
         return self._meta
 
 
-class Followers(Reversible):
+class Followers(Reversible[bytes, MetaData]):
     """Followers."""
 
     def _restore(self) -> bytes:
@@ -119,7 +122,7 @@ class Followers(Reversible):
         raise StatesError
 
 
-class KeyTrunc(Reversible):
+class KeyTrunc(Reversible[MetaData, MetaData]):
     """KeyTrunc."""
 
     def _restore(self) -> MetaData:
@@ -159,7 +162,7 @@ class KeyTrunc(Reversible):
         return condense
 
 
-class Reshape(Reversible):
+class Reshape(Reversible[MetaData, MetaTree]):
     """Reshape."""
 
     def _restore(self) -> MetaData:
@@ -172,10 +175,10 @@ class Reshape(Reversible):
                     bytes_key = bytes((key,))
                 else:
                     bytes_key = key
+                del tree_root[key]
                 if isinstance(value, int):
                     flat_node[bytes_key] = value
                     continue
-                del tree_root[key]
                 for child_key, child_value in value.items():
                     if isinstance(child_key, int):
                         child_key = bytes((child_key,))
@@ -191,6 +194,85 @@ class Reshape(Reversible):
                 ref = ref.setdefault(lookback, {})
             ref[key[-1]] = value
         return tree_root
+
+
+class Serialize(Reversible[MetaTree, FlatFmt]):
+    """Serialize."""
+
+    def _restore(self) -> MetaTree:
+        """restore."""
+        flat_node = {}  # type: Dict[bytes, int]
+        tree_root = dict(self._meta.items())
+        while tree_root:
+            for key, value in tuple(tree_root.items()):
+                if isinstance(key, int):
+                    bytes_key = bytes((key,))
+                else:
+                    bytes_key = key
+                del tree_root[key]
+                if isinstance(value, int):
+                    flat_node[bytes_key] = value
+                    continue
+                for child_key, child_value in value.items():
+                    if isinstance(child_key, int):
+                        child_key = bytes((child_key,))
+                    tree_root[bytes_key + child_key] = child_value
+        return flat_node
+
+    def freeze_tree(tree_root: MetaTree, found) -> MetaTree:
+        """freeze_tree."""
+        root = {}
+        for key, value in tree_root.items():
+            if isinstance(value, int):
+                root[key] = value
+                continue
+            frozen = freeze_tree(value, found)
+            if frozen in found:
+                root[key] = next(sub for sub in found if sub == frozen)
+                continue
+            root[key] = frozen
+            found.add(frozen)
+        return frozenset(root.items())
+
+
+    def extract_max(tree_root: MetaTree) -> int:
+        """extract_max."""
+        return max(key for key, _ in tree_root)
+
+
+    def extract_min(tree_root: MetaTree) -> int:
+        """extract_min."""
+        return min(key for key, _ in tree_root)
+
+
+    def serialize_branch(
+            tree_root: MetaTree, found, base_idx: int=0) -> FlatFmt:
+        """convert branch to wire format."""
+        small = extract_min(tree_root) - 1
+        flat = [None] * (extract_max(tree_root) - small + 1)
+        flat[0] = small
+        next_idx = base_idx + len(flat)
+        for key, value in tree_root:
+            key -= small
+            if isinstance(value, int):
+                flat[key] = value
+                continue
+            if value in found:
+                flat[key] = found[value]
+                continue
+            seri = serialize_branch(value, found, next_idx)
+            flat[key] = next_idx
+            found[value] = next_idx
+            next_idx += len(seri)
+            flat += seri
+        return flat
+
+
+    def _analyse(self) -> FlatFmt:
+        """convert mapping to wire format."""
+        frozen = self.freeze_tree(self._data, set())
+        top = self.serialize_branch(frozen, dict())
+        return [self.extract_max(frozen)] + top
 
 
 def pack_format(flat: FlatFmt) -> bytes:
@@ -220,62 +302,6 @@ def pack_format(flat: FlatFmt) -> bytes:
     format_str = SIGNATURE + format_str.encode()
 
     return format_str + b''.join(packer.pack(real_idx(idx)) for idx in flat)
-
-
-def freeze_tree(tree_root: MetaTree, found) -> MetaTree:
-    """freeze_tree."""
-    root = {}
-    for key, value in tree_root.items():
-        if isinstance(value, int):
-            root[key] = value
-            continue
-        frozen = freeze_tree(value, found)
-        if frozen in found:
-            root[key] = next(sub for sub in found if sub == frozen)
-            continue
-        root[key] = frozen
-        found.add(frozen)
-    return frozenset(root.items())
-
-
-def extract_max(tree_root: MetaTree) -> int:
-    """extract_max."""
-    return max(key for key, _ in tree_root)
-
-
-def extract_min(tree_root: MetaTree) -> int:
-    """extract_min."""
-    return min(key for key, _ in tree_root)
-
-
-def serialize_branch(
-        tree_root: MetaTree, found, base_idx: int=0) -> FlatFmt:
-    """convert branch to wire format."""
-    small = extract_min(tree_root) - 1
-    flat = [None] * (extract_max(tree_root) - small + 1)
-    flat[0] = small
-    next_idx = base_idx + len(flat)
-    for key, value in tree_root:
-        key -= small
-        if isinstance(value, int):
-            flat[key] = value
-            continue
-        if value in found:
-            flat[key] = found[value]
-            continue
-        seri = serialize_branch(value, found, next_idx)
-        flat[key] = next_idx
-        found[value] = next_idx
-        next_idx += len(seri)
-        flat += seri
-    return flat
-
-
-def serialize_meta(tree_root: MetaTree) -> bytes:
-    """convert mapping to wire format."""
-    frozen = freeze_tree(tree_root, set())
-    top = serialize_branch(frozen, dict())
-    return pack_format([extract_max(frozen)] + top)
 
 
 def make_queue(tree_root: MetaTree) -> MetaKeys:
@@ -345,9 +371,10 @@ class States(Reversible):
         """analyse."""
         node = Followers.from_data(self._data)
         node = KeyTrunc.from_data(node.meta)
-        tree = Reshape.from_data(node.meta)
-        tree_root = flatten_tree(tree)
-        return serialize_meta(merge_tree(tree_root))
+        node = Reshape.from_data(node.meta)
+        tree_root = merge_tree(flatten_tree(node.meta))
+        node = Serialize.from_data(tree_root)
+        return pack_format(node.meta)
 
 
 class StatesCompressor:
@@ -592,9 +619,12 @@ def open(filename: str, **kwargs) -> Files:   # noqa
 
 if __name__ == '__main__':
     with io.FileIO(__file__) as istream:
-        orig = KeyTrunc.from_data(Followers.from_data(istream.read()).meta).meta
-        reshape = Reshape.from_data(orig)
-        new = Reshape.from_meta(reshape.meta).data
+        orig = Reshape.from_data(
+            KeyTrunc.from_data(
+                Followers.from_data(
+                    istream.read()).meta).meta).meta
+        serialize = Serialize.from_data(orig)
+        new = Serialize.from_meta(serialize.meta).data
         for key, value in orig.items():
             if key not in new or new[key] != value:
                 pprint((key, value))
